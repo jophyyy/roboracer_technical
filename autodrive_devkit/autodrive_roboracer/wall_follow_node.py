@@ -25,16 +25,17 @@ class WallFollowNode(Node):
         super().__init__('wall_follow_node')
 
         # Tunable Controller Parameters
-        self.max_speed = 0.85          # Top speed on straights (0.0 to 1.0)
-        self.min_speed = 0.40          # Cornering speed (0.0 to 1.0)
-        self.bubble_radius = 0.38      # Safety bubble around close obstacles in meters
+        self.max_speed = 0.48          # Controlled top speed on straightaways (0.0 to 1.0)
+        self.corner_speed = 0.18       # Slow, stable cornering speed to prevent skidding out
+        self.min_crawl_speed = 0.10    # Minimum speed when approaching tight hairpin walls
+        self.bubble_radius = 0.45      # Safety bubble around close obstacles in meters
         self.max_lidar_range = 8.0     # Cap very far readings to avoid false gaps
         self.forward_fov_deg = 150.0   # Field of view considered for path planning (+- 75 deg)
-        self.lookahead_dist = 2.5      # Distance threshold to consider obstacle close
+        self.lookahead_dist = 3.2      # Distance threshold to consider obstacle close
 
-        # Previous steering for derivative smoothing
+        # Steering smoothing parameters
         self.prev_steering = 0.0
-        self.steering_smooth_alpha = 0.85
+        self.steering_smooth_alpha = 0.75  # Responsive steering without oscillation
 
         # Best QoS for real-time sensor streams
         qos = QoSProfile(
@@ -63,7 +64,7 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('WallFollowNode initialized. Ready for Autonomous Racing!')
+        self.get_logger().info('WallFollowNode initialized with smooth cornering & speed profiling.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc):
         """Converts an angle in radians to the closest LiDAR scan index."""
@@ -174,52 +175,62 @@ class WallFollowNode(Node):
 
         target_angle = angle_min + target_global_idx * angle_inc
 
-        # 6. Center Bias / Wall Balancing:
-        # Check 90 degrees left and 90 degrees right to balance track center
+        # 6. Lateral Track Balancing (Centering):
+        # Sample side beams at 90 deg left and 90 deg right to keep car centered in corridor
         idx_90_left = min(total_beams - 1, self.get_index_for_angle(math.radians(90.0), angle_min, angle_inc))
         idx_90_right = max(0, self.get_index_for_angle(math.radians(-90.0), angle_min, angle_inc))
-        left_dist = np.mean(ranges[idx_90_left - 15:idx_90_left + 15])
-        right_dist = np.mean(ranges[idx_90_right - 15:idx_90_right + 15])
+        left_dist = np.mean(ranges[max(0, idx_90_left - 20):min(total_beams, idx_90_left + 20)])
+        right_dist = np.mean(ranges[max(0, idx_90_right - 20):min(total_beams, idx_90_right + 20)])
 
-        # Lateral error: positive if closer to right wall (steer left), negative if closer to left
-        lateral_error = (left_dist - right_dist) * 0.12
-        lateral_error = np.clip(lateral_error, -0.25, 0.25)
+        # Lateral correction: steer away from whichever wall is closer
+        lateral_error = (left_dist - right_dist) * 0.18
+        lateral_error = np.clip(lateral_error, -0.30, 0.30)
 
         # Combined steering goal (in radians)
         steering_rad = target_angle + lateral_error
 
-        # 7. Map to [-1, 1] steering command (1.0 = ~0.52 rad left, -1.0 = ~0.52 rad right)
+        # 7. Map to [-1, 1] steering command (1.0 = full left ~0.52 rad, -1.0 = full right)
         max_steer_rad = 0.52
-        steering_cmd = steering_rad / max_steer_rad
-        steering_cmd = float(np.clip(steering_cmd, -1.0, 1.0))
+        raw_steering = steering_rad / max_steer_rad
+        raw_steering = float(np.clip(raw_steering, -1.0, 1.0))
 
-        # Low-pass filter steering to avoid jitter
-        steering_cmd = self.steering_smooth_alpha * steering_cmd + (1.0 - self.steering_smooth_alpha) * self.prev_steering
+        # Smooth steering to prevent jerky zig-zag
+        steering_cmd = self.steering_smooth_alpha * raw_steering + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         self.prev_steering = steering_cmd
 
-        # 8. Adaptive Throttle Control:
-        # Direct line-of-sight straight ahead
+        # 8. Adaptive Smooth Speed Profiling:
+        # Check forward line-of-sight clearance
         center_idx = self.get_index_for_angle(0.0, angle_min, angle_inc)
-        forward_clearance = np.min(ranges[center_idx - 20:center_idx + 21])
+        forward_clearance = np.min(ranges[max(0, center_idx - 25):min(total_beams, center_idx + 26)])
 
-        # Scale speed based on steering angle and forward clearance
-        turn_severity = abs(steering_cmd)
-        if forward_clearance > 3.0 and turn_severity < 0.20:
-            throttle_cmd = self.max_speed
-        elif forward_clearance > 1.8 and turn_severity < 0.45:
-            throttle_cmd = (self.max_speed + self.min_speed) * 0.5
+        turn_severity = abs(steering_cmd)  # 0.0 = straight, 1.0 = full turn lock
+
+        # A) Speed based on steering angle:
+        # The harder the turn, the slower the speed (drops down to corner_speed)
+        speed_from_steering = self.max_speed - (self.max_speed - self.corner_speed) * (turn_severity ** 1.3)
+
+        # B) Lookahead proactive braking:
+        # If an approaching corner or wall is within 4.5 meters, decelerate proactively
+        if forward_clearance < 1.4:
+            speed_from_clearance = self.min_crawl_speed
+        elif forward_clearance < 4.2:
+            # Smooth interpolation from max_speed down to corner_speed
+            alpha = (forward_clearance - 1.4) / (4.2 - 1.4)
+            speed_from_clearance = self.corner_speed + alpha * (self.max_speed - self.corner_speed)
         else:
-            throttle_cmd = self.min_speed
+            speed_from_clearance = self.max_speed
 
-        throttle_cmd = float(np.clip(throttle_cmd, 0.0, 1.0))
+        # Final throttle is the safest of steering limit and sightline limit
+        throttle_cmd = min(speed_from_steering, speed_from_clearance)
+        throttle_cmd = float(np.clip(throttle_cmd, self.min_crawl_speed, self.max_speed))
 
         # Publish commands
         str_msg = Float32()
-        str_msg.data = steering_cmd
+        str_msg.data = float(steering_cmd)
         self.steering_pub.publish(str_msg)
 
         thr_msg = Float32()
-        thr_msg.data = throttle_cmd
+        thr_msg.data = float(throttle_cmd)
         self.throttle_pub.publish(thr_msg)
 
 
