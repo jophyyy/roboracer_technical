@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Penn RoboRacer Autonomous Competition Controller v2.4
-Zero-Jitter Straightaway Drive, Asymmetric Corridor Corner Locking, and Even Throttle.
+Penn RoboRacer Autonomous Wall Following & Intersection Navigation Controller
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
@@ -25,27 +24,20 @@ class WallFollowNode(Node):
     def __init__(self):
         super().__init__('wall_follow_node')
 
-        # Speed settings:
-        # Constant, steady 0.24 cornering speed provides continuous torque through steering scrub
-        self.straight_speed = 0.32      # Controlled straightaway speed
-        self.corner_speed = 0.24        # Even, steady cornering speed with strong forward drive
-        self.min_drive_speed = 0.20     # Strict positive floor (never stalls, never reverses)
+        # Tuned Speed & Turning Dynamics
+        # ALWAYS positive throttle - never reverses or rocks back and forth!
+        self.straight_speed = 0.30     # Controlled straightaway speed
+        self.corner_speed = 0.18       # Steady forward cornering speed (matches confirmed working respawn speed)
+        self.min_drive_speed = 0.16    # Minimum forward throttle (guaranteed forward roll)
 
-        # Perception & Corner Decision Thresholds
-        self.max_lidar_range = 8.0      # Cap distant beams
-        self.corner_entry_dist = 4.2    # Distance to front wall when cornering engages
-        self.asymmetry_threshold = 0.60 # Minimum opening difference (meters) to confirm an actual turn
+        self.max_lidar_range = 8.0     # Cap distant beams
+        # Wide 200-degree FOV (+-100 deg) so 90-degree corners and intersections are completely visible!
+        self.forward_fov_deg = 200.0   
+        self.max_steer_rad = 0.52      # Max steering angle (~30 degrees)
 
-        # Corner Lock State
-        self.in_turn = False
-        self.latched_turn_dir = 0.0     # +1.0 = Left, -1.0 = Right
-
-        # Steering smoothing (heavily damped on straights, responsive in corners)
+        # Responsive steering smoothing
         self.prev_steering = 0.0
-        self.steering_smooth_alpha = 0.85
-
-        # Telemetry counter
-        self.call_count = 0
+        self.steering_smooth_alpha = 0.80  # Snappy, decisive turn-in at corners
 
         # Reliable QoS matching bridge
         qos = QoSProfile(
@@ -54,6 +46,7 @@ class WallFollowNode(Node):
             depth=1
         )
 
+        # Subscribers & Publishers
         self.lidar_sub = self.create_subscription(
             LaserScan,
             '/autodrive/roboracer_1/lidar',
@@ -73,7 +66,7 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Zero-Jitter Competition Controller v2.4 active.')
+        self.get_logger().info('RoboRacer Intersection & Cornering Controller active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc):
         return int(round((angle_rad - angle_min) / angle_inc))
@@ -91,8 +84,39 @@ class WallFollowNode(Node):
         proc = np.convolve(proc, kernel, mode='same')
         return proc
 
+    def find_best_corridor(self, sector_ranges, threshold=1.2):
+        """
+        Finds the true track corridor by scoring openings using width * depth.
+        This ensures 90-degree turn corridors are strongly prioritized over shallow dead-ends.
+        """
+        mask = sector_ranges > threshold
+        if not np.any(mask):
+            furthest_idx = int(np.argmax(sector_ranges))
+            return furthest_idx, furthest_idx
+
+        padded = np.concatenate(([0], mask.astype(int), [0]))
+        diffs = np.diff(padded)
+        starts = np.where(diffs == 1)[0]
+        ends = np.where(diffs == -1)[0]
+
+        best_score = -1.0
+        best_gap = (starts[0], ends[0] - 1)
+
+        for s, e in zip(starts, ends):
+            gap_slice = sector_ranges[s:e]
+            width = e - s
+            mean_depth = float(np.mean(gap_slice))
+            max_depth = float(np.max(gap_slice))
+
+            # Depth-weighted score: heavily rewards the long open corridor
+            score = width * (mean_depth ** 1.8) * max_depth
+            if score > best_score:
+                best_score = score
+                best_gap = (s, e - 1)
+
+        return best_gap
+
     def lidar_callback(self, scan_msg: LaserScan):
-        self.call_count += 1
         angle_min = scan_msg.angle_min
         angle_inc = scan_msg.angle_increment
         total_beams = len(scan_msg.ranges)
@@ -103,80 +127,53 @@ class WallFollowNode(Node):
         # 1. Clean raw LiDAR
         clean_ranges = self.preprocess_lidar(scan_msg.ranges)
 
-        # 2. Key directional sectors:
-        # A) Front cone (+-12 degrees)
-        idx_f_l = self.get_index_for_angle(math.radians(12.0), angle_min, angle_inc)
-        idx_f_r = self.get_index_for_angle(math.radians(-12.0), angle_min, angle_inc)
-        front_dist = float(np.min(clean_ranges[min(idx_f_r, idx_f_l):max(idx_f_r, idx_f_l) + 1]))
+        # 2. Extract wide planning sector (+- 100 degrees to see 90-deg turns)
+        fov_rad = math.radians(self.forward_fov_deg / 2.0)
+        idx_right = max(0, self.get_index_for_angle(-fov_rad, angle_min, angle_inc))
+        idx_left = min(total_beams - 1, self.get_index_for_angle(fov_rad, angle_min, angle_inc))
 
-        # B) Forward-Side Corner Opening Sectors (+20 to +70 deg vs -70 to -20 deg)
-        idx_l1 = self.get_index_for_angle(math.radians(20.0), angle_min, angle_inc)
-        idx_l2 = self.get_index_for_angle(math.radians(70.0), angle_min, angle_inc)
-        left_depth = float(np.mean(clean_ranges[min(idx_l1, idx_l2):max(idx_l1, idx_l2) + 1]))
+        idx_start = min(idx_right, idx_left)
+        idx_end = max(idx_right, idx_left)
+        sector = np.copy(clean_ranges[idx_start:idx_end + 1])
 
-        idx_r1 = self.get_index_for_angle(math.radians(-70.0), angle_min, angle_inc)
-        idx_r2 = self.get_index_for_angle(math.radians(-20.0), angle_min, angle_inc)
-        right_depth = float(np.mean(clean_ranges[min(idx_r1, idx_r2):max(idx_r1, idx_r2) + 1]))
+        # 3. Find the best corridor leading into the turn/intersection
+        gap_start, gap_end = self.find_best_corridor(sector, threshold=1.2)
 
-        depth_diff = left_depth - right_depth
+        # 4. Target the SAFE CENTER of the corridor
+        goal_sector_idx = int((gap_start + gap_end) / 2.0)
+        target_global_idx = idx_start + goal_sector_idx
+        target_angle = angle_min + target_global_idx * angle_inc
 
-        # C) Direct side distances at +-90 deg
-        idx_90_l = min(total_beams - 1, self.get_index_for_angle(math.radians(90.0), angle_min, angle_inc))
-        idx_90_r = max(0, self.get_index_for_angle(math.radians(-90.0), angle_min, angle_inc))
-        side_l = float(np.mean(clean_ranges[max(0, idx_90_l - 10):min(total_beams, idx_90_l + 11)]))
-        side_r = float(np.mean(clean_ranges[max(0, idx_90_r - 10):min(total_beams, idx_90_r + 11)]))
+        # 5. Direct Decisive Steering:
+        # Normalize target angle to steering range [-1.0, 1.0]
+        raw_steering = float(np.clip(target_angle / self.max_steer_rad, -1.0, 1.0))
 
-        # 3. State Machine: Locked Turn Execution vs. Smooth Forward Drive
-        if self.in_turn:
-            # We are actively rotating through a corner
-            if front_dist > 4.2:
-                # The car has completed rotation and is looking straight down the new corridor!
-                self.in_turn = False
-                self.latched_turn_dir = 0.0
-                raw_steering = 0.0
-                throttle_cmd = self.straight_speed
-            else:
-                # Hold decisive full lock in the latched corner direction
-                raw_steering = self.latched_turn_dir * 1.0
-                # Maintain constant, even torque to pull through the turn
-                throttle_cmd = self.corner_speed
-
-        else:
-            # Check if a real turn is approaching:
-            # Front wall is closer than 4.2m AND there is a clear opening on one side
-            if front_dist < self.corner_entry_dist and abs(depth_diff) > self.asymmetry_threshold:
-                self.in_turn = True
-                self.latched_turn_dir = 1.0 if depth_diff > 0 else -1.0
-                raw_steering = self.latched_turn_dir * 0.90
-                throttle_cmd = self.corner_speed
-
-            else:
-                # Straightaway Drive: DRIVE FORWARD (Zero steering jitter!)
-                # Apply a soft boundary nudge ONLY if dangerously close to a wall (<0.32m)
-                if side_l < 0.32:
-                    raw_steering = -0.10  # Gentle nudge right away from left wall
-                elif side_r < 0.32:
-                    raw_steering = 0.10   # Gentle nudge left away from right wall
-                else:
-                    raw_steering = 0.0    # DEAD-STRAIGHT FORWARD DRIVE
-
-                throttle_cmd = self.straight_speed
-
-        # 4. Smooth steering
+        # Smooth steering to prevent twitching while maintaining rapid turn response
         steering_cmd = self.steering_smooth_alpha * raw_steering + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         self.prev_steering = steering_cmd
 
-        # 5. Strict forward throttle clamp
+        # 6. Smooth Forward Throttle Control (ALWAYS POSITIVE - NO REVERSING!):
+        # Forward clearance directly ahead (+- 15 degrees)
+        center_idx = self.get_index_for_angle(0.0, angle_min, angle_inc)
+        forward_clearance = float(np.min(clean_ranges[max(0, center_idx - 25):min(total_beams, center_idx + 26)]))
+        turn_severity = abs(steering_cmd)
+
+        # If a turn or wall is approaching, smoothly settle into cornering speed
+        if forward_clearance < 3.2 or turn_severity > 0.20:
+            # Entering or in the turn: steady, planted corner speed
+            throttle_cmd = self.corner_speed
+        elif forward_clearance < 5.0:
+            # Smoothly transition from straight speed down to corner speed
+            alpha = (forward_clearance - 3.2) / (5.0 - 3.2)
+            throttle_cmd = self.corner_speed + alpha * (self.straight_speed - self.corner_speed)
+        else:
+            # Wide open straight
+            throttle_cmd = self.straight_speed
+
+        # Guarantee forward drive: clamp between min_drive_speed and straight_speed
         throttle_cmd = float(np.clip(throttle_cmd, self.min_drive_speed, self.straight_speed))
 
-        # Heartbeat log every 40 frames (~1 sec)
-        if self.call_count % 40 == 0:
-            mode = f'TURN[{self.latched_turn_dir:+.0f}]' if self.in_turn else 'STRAIGHT'
-            self.get_logger().info(
-                f'[LIVE v2.4] {mode} | Steer: {steering_cmd:+.2f} | Thr: {throttle_cmd:.2f} | Front: {front_dist:.2f}m | Diff: {depth_diff:+.2f}m'
-            )
-
-        # 6. Publish actuator commands
+        # Publish commands
         str_msg = Float32()
         str_msg.data = float(steering_cmd)
         self.steering_pub.publish(str_msg)
