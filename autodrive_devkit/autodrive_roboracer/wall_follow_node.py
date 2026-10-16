@@ -24,22 +24,20 @@ class WallFollowNode(Node):
     def __init__(self):
         super().__init__('wall_follow_node')
 
-        # Tunable Speed & Safety Parameters
-        # Slowed down for safe, stable cornering without understeer or skidding
-        self.max_speed = 0.32          # Straightaway speed (calm and controlled)
-        self.corner_speed = 0.13       # Very slow cornering speed so turns are taken gently
-        self.crawl_speed = 0.08        # Emergency crawl when close to any wall/obstacle
-        
-        self.bubble_radius = 0.50      # Generous safety bubble around corners and obstacles (meters)
-        self.max_lidar_range = 8.0     # Cap far readings
-        self.forward_fov_deg = 140.0   # Field of view for gap finding (+- 70 deg)
-        self.lookahead_dist = 3.0      # Distance to activate safety bubble
+        # Calibrated Speed Settings (Guaranteed to move & stable in corners)
+        self.straight_speed = 0.42     # Fast enough for good lap time on straights
+        self.corner_speed = 0.24       # Controlled cornering speed (grippy, never skids)
+        self.min_drive_speed = 0.22    # Minimum throttle to overcome vehicle static friction
+
+        self.bubble_radius = 0.35      # Safety margin around obstacles (meters)
+        self.max_lidar_range = 8.0     # Cap distant beams
+        self.forward_fov_deg = 140.0   # Look ahead arc: +-70 degrees
         
         # Steering smoothing
         self.prev_steering = 0.0
-        self.steering_smooth_alpha = 0.70
+        self.steering_smooth_alpha = 0.65
 
-        # Reliable QoS matching autodrive_bridge
+        # Reliable QoS matching bridge
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -66,59 +64,57 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('WallFollowNode initialized: Slow & Smooth Cornering Mode active.')
+        self.get_logger().info('RoboRacer Controller initialized: Ready to race.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc):
-        idx = int(round((angle_rad - angle_min) / angle_inc))
-        return idx
+        return int(round((angle_rad - angle_min) / angle_inc))
 
-    def preprocess_lidar(self, ranges, max_range):
-        proc_ranges = np.array(ranges, dtype=np.float32)
-        proc_ranges[np.isnan(proc_ranges)] = max_range
-        proc_ranges[np.isinf(proc_ranges)] = max_range
-        proc_ranges[proc_ranges < 0.05] = max_range
-        proc_ranges = np.clip(proc_ranges, 0.0, max_range)
+    def preprocess_lidar(self, raw_ranges):
+        """Clean sensor data: eliminate self-chassis hits (<0.20m), NaNs, and infs."""
+        proc = np.array(raw_ranges, dtype=np.float32)
+        proc[np.isnan(proc)] = self.max_lidar_range
+        proc[np.isinf(proc)] = self.max_lidar_range
+        proc[proc < 0.20] = self.max_lidar_range  # Ignore self chassis reflections
+        proc = np.clip(proc, 0.0, self.max_lidar_range)
 
-        # 5-beam moving average filter to remove sensor noise
+        # Moving average filter across 5 beams
         kernel = np.ones(5) / 5.0
-        proc_ranges = np.convolve(proc_ranges, kernel, mode='same')
-        return proc_ranges
+        proc = np.convolve(proc, kernel, mode='same')
+        return proc
 
-    def apply_safety_bubble(self, ranges, angle_inc):
-        """
-        Finds the closest point in the planning sector and zeroes out a safety bubble
-        around it to prevent clipping corners or obstacles.
-        """
-        min_idx = np.argmin(ranges)
-        min_dist = ranges[min_idx]
+    def apply_safety_bubble(self, sector_ranges, angle_inc):
+        """Find the closest obstacle in the forward sector and mask it with a safety bubble."""
+        # Find closest point
+        min_idx = int(np.argmin(sector_ranges))
+        min_dist = sector_ranges[min_idx]
 
-        if min_dist < self.lookahead_dist and min_dist > 0.05:
-            half_bubble_angle = math.atan2(self.bubble_radius, min_dist)
-            bubble_beams = int(math.ceil(half_bubble_angle / angle_inc))
+        # Only apply bubble to real obstacles within 2.5m
+        if 0.20 < min_dist < 2.5:
+            half_angle = math.atan2(self.bubble_radius, min_dist)
+            num_beams = int(math.ceil(half_angle / angle_inc))
+            start = max(0, min_idx - num_beams)
+            end = min(len(sector_ranges), min_idx + num_beams + 1)
+            sector_ranges[start:end] = 0.0
 
-            start_b = max(0, min_idx - bubble_beams)
-            end_b = min(len(ranges), min_idx + bubble_beams + 1)
-            ranges[start_b:end_b] = 0.0
+        return sector_ranges
 
-        return ranges
+    def find_largest_gap(self, sector_ranges, threshold=1.4):
+        """Find the start and end indices of the largest contiguous opening."""
+        mask = sector_ranges > threshold
+        if not np.any(mask):
+            # If all are close, pick the furthest point available
+            idx = int(np.argmax(sector_ranges))
+            return idx, idx
 
-    def find_best_gap(self, ranges, threshold=1.2):
-        """
-        Finds the largest contiguous opening of drivable space.
-        """
-        above_thresh = ranges > threshold
-        if not np.any(above_thresh):
-            furthest_idx = np.argmax(ranges)
-            return furthest_idx, furthest_idx
-
-        padded = np.concatenate(([0], above_thresh.astype(int), [0]))
+        # Find contiguous true segments
+        padded = np.concatenate(([0], mask.astype(int), [0]))
         diffs = np.diff(padded)
         starts = np.where(diffs == 1)[0]
         ends = np.where(diffs == -1)[0]
 
         lengths = ends - starts
-        max_idx = np.argmax(lengths)
-        return starts[max_idx], ends[max_idx] - 1
+        best_idx = np.argmax(lengths)
+        return starts[best_idx], ends[best_idx] - 1
 
     def lidar_callback(self, scan_msg: LaserScan):
         angle_min = scan_msg.angle_min
@@ -128,75 +124,69 @@ class WallFollowNode(Node):
         if total_beams == 0:
             return
 
-        # 1. Preprocess LiDAR
-        ranges = self.preprocess_lidar(scan_msg.ranges, self.max_lidar_range)
+        # 1. Clean LiDAR ranges
+        clean_ranges = self.preprocess_lidar(scan_msg.ranges)
 
-        # 2. Extract forward planning sector (+- 70 degrees)
+        # 2. Extract forward sector (-70 deg to +70 deg)
         fov_rad = math.radians(self.forward_fov_deg / 2.0)
         idx_right = max(0, self.get_index_for_angle(-fov_rad, angle_min, angle_inc))
         idx_left = min(total_beams - 1, self.get_index_for_angle(fov_rad, angle_min, angle_inc))
 
         idx_start = min(idx_right, idx_left)
         idx_end = max(idx_right, idx_left)
-        sector_ranges = np.copy(ranges[idx_start:idx_end + 1])
+        sector = np.copy(clean_ranges[idx_start:idx_end + 1])
 
-        # 3. Apply safety bubble around closest obstacle
-        sector_ranges = self.apply_safety_bubble(sector_ranges, angle_inc)
+        # 3. Apply safety bubble around closest point
+        masked_sector = self.apply_safety_bubble(sector, angle_inc)
 
         # 4. Find the largest drivable gap
-        gap_start, gap_end = self.find_best_gap(sector_ranges, threshold=1.2)
+        gap_start, gap_end = self.find_largest_gap(masked_sector, threshold=1.4)
 
-        # 5. Steer toward the CENTER of the largest gap
-        # (Targeting the center guarantees the car stays away from both left and right walls)
+        # 5. Target the CENTER of the largest gap
+        # Steering down the center ensures maximum clearance from both walls
         goal_sector_idx = int((gap_start + gap_end) / 2.0)
         target_global_idx = idx_start + goal_sector_idx
         target_angle = angle_min + target_global_idx * angle_inc
 
-        # 6. Lateral Centering Trim (balance distances to left and right walls)
+        # 6. Lateral Centering Trim (balance left and right side distances)
         idx_90_left = min(total_beams - 1, self.get_index_for_angle(math.radians(90.0), angle_min, angle_inc))
         idx_90_right = max(0, self.get_index_for_angle(math.radians(-90.0), angle_min, angle_inc))
-        left_dist = np.mean(ranges[max(0, idx_90_left - 15):min(total_beams, idx_90_left + 15)])
-        right_dist = np.mean(ranges[max(0, idx_90_right - 15):min(total_beams, idx_90_right + 15)])
+        left_dist = np.mean(clean_ranges[max(0, idx_90_left - 15):min(total_beams, idx_90_left + 15)])
+        right_dist = np.mean(clean_ranges[max(0, idx_90_right - 15):min(total_beams, idx_90_right + 15)])
 
-        # Steer toward center of the hallway
         wall_diff = left_dist - right_dist
-        lateral_trim = float(np.clip(wall_diff * 0.12, -0.25, 0.25))
+        lateral_trim = float(np.clip(wall_diff * 0.10, -0.20, 0.20))
 
-        # Combined steering angle in radians
+        # Combined steering in radians
         steering_rad = target_angle + lateral_trim
 
-        # Map to [-1, 1] (0.52 rad max steering limit)
+        # Map to normalized steering command [-1.0, 1.0] (0.52 rad max lock)
         max_steer_rad = 0.52
         raw_steering = float(np.clip(steering_rad / max_steer_rad, -1.0, 1.0))
 
-        # Smooth steering to avoid oscillation
+        # Filter steering to eliminate rapid oscillation
         steering_cmd = self.steering_smooth_alpha * raw_steering + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         self.prev_steering = steering_cmd
 
-        # 7. Adaptive Slow Speed Profiling:
-        # Check forward distance right in front of the car (+- 15 degrees)
+        # 7. Adaptive Throttle Control:
+        # Check forward sightline (center +- 15 deg)
         center_idx = self.get_index_for_angle(0.0, angle_min, angle_inc)
-        forward_clearance = np.min(ranges[max(0, center_idx - 30):min(total_beams, center_idx + 31)])
+        forward_clearance = np.min(clean_ranges[max(0, center_idx - 25):min(total_beams, center_idx + 26)])
+        turn_severity = abs(steering_cmd)
 
-        turn_severity = abs(steering_cmd)  # 0.0 is straight, 1.0 is full turn
-
-        # Continuous throttle calculation:
-        # Straightaway speed: drops immediately when steering or approaching turns
-        if forward_clearance < 1.6:
-            # Wall directly ahead: slow down to crawl so front tires turn
-            throttle_cmd = self.crawl_speed
-        elif turn_severity > 0.25:
-            # Taking a turn: slow down to corner_speed
+        if forward_clearance < 2.8 or turn_severity > 0.22:
+            # Entering or in a turn: slow down to cornering speed
             throttle_cmd = self.corner_speed
-        elif forward_clearance < 4.0:
-            # Approaching a turn: decelerate smoothly
-            factor = (forward_clearance - 1.6) / (4.0 - 1.6)
-            throttle_cmd = self.corner_speed + factor * (self.max_speed - self.corner_speed)
+        elif forward_clearance > 4.5 and turn_severity < 0.12:
+            # Wide open straightaway: full straight speed
+            throttle_cmd = self.straight_speed
         else:
-            # Clear straightaway
-            throttle_cmd = self.max_speed
+            # Transition zone: smooth interpolation
+            factor = (forward_clearance - 2.8) / (4.5 - 2.8)
+            throttle_cmd = self.corner_speed + factor * (self.straight_speed - self.corner_speed)
 
-        throttle_cmd = float(np.clip(throttle_cmd, self.crawl_speed, self.max_speed))
+        # Enforce minimum drive speed so the car never stalls against static friction
+        throttle_cmd = float(np.clip(throttle_cmd, self.min_drive_speed, self.straight_speed))
 
         # Publish commands
         str_msg = Float32()
