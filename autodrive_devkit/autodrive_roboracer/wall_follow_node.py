@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Penn RoboRacer Autonomous Wall Following & Intersection Navigation Controller
+Penn RoboRacer Autonomous Competition Controller
+Multi-Phase Corner Anticipation, Turn Latch, and Safe Drivable Gap Following.
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
@@ -24,20 +25,28 @@ class WallFollowNode(Node):
     def __init__(self):
         super().__init__('wall_follow_node')
 
-        # Tuned Speed & Turning Dynamics
-        # ALWAYS positive throttle - never reverses or rocks back and forth!
-        self.straight_speed = 0.30     # Controlled straightaway speed
-        self.corner_speed = 0.18       # Steady forward cornering speed (matches confirmed working respawn speed)
-        self.min_drive_speed = 0.16    # Minimum forward throttle (guaranteed forward roll)
+        # Speed Profiles (calibrated for high stability and fast lap times)
+        self.straight_speed = 0.35      # Swift straightaway speed
+        self.corner_speed = 0.20        # Safe, high-traction cornering speed
+        self.min_drive_speed = 0.18     # Minimum forward throttle (guaranteed no stall)
 
-        self.max_lidar_range = 8.0     # Cap distant beams
-        # Wide 200-degree FOV (+-100 deg) so 90-degree corners and intersections are completely visible!
-        self.forward_fov_deg = 200.0   
-        self.max_steer_rad = 0.52      # Max steering angle (~30 degrees)
+        # Perception Geometry
+        self.max_lidar_range = 8.0      # Cap distant beams
+        self.forward_fov_deg = 200.0    # Look wide (+-100 deg) to detect 90-deg corridors
+        self.max_steer_rad = 0.52       # Max steering limit (~30 degrees)
+        self.safety_bubble_radius = 0.40 # Wall safety clearance margin (meters)
 
-        # Responsive steering smoothing
+        # Lookahead & Early Turn Initiation
+        self.early_lookahead_dist = 5.2 # Begin decelerating 5.2m before front wall
+        self.corner_turn_dist = 4.0     # Begin steering 4.0m in advance of the corner
+
+        # Corner Latch State (prevents premature wheel straightening mid-turn)
+        self.in_corner = False
+        self.latched_turn_dir = 0.0     # +1.0 = Left, -1.0 = Right
+
+        # Steering smoothing filter
         self.prev_steering = 0.0
-        self.steering_smooth_alpha = 0.80  # Snappy, decisive turn-in at corners
+        self.steering_smooth_alpha = 0.80
 
         # Reliable QoS matching bridge
         qos = QoSProfile(
@@ -66,7 +75,7 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Intersection & Cornering Controller active.')
+        self.get_logger().info('RoboRacer High-Precision Cornering Controller active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc):
         return int(round((angle_rad - angle_min) / angle_inc))
@@ -84,15 +93,36 @@ class WallFollowNode(Node):
         proc = np.convolve(proc, kernel, mode='same')
         return proc
 
-    def find_best_corridor(self, sector_ranges, threshold=1.2):
-        """
-        Finds the true track corridor by scoring openings using width * depth.
-        This ensures 90-degree turn corridors are strongly prioritized over shallow dead-ends.
-        """
-        mask = sector_ranges > threshold
+    def apply_safety_bubble(self, ranges, angle_min, angle_inc):
+        """Inflates closest obstacle by safety_bubble_radius to prevent clipping corner apexes."""
+        out = np.copy(ranges)
+        min_idx = int(np.argmin(out))
+        min_dist = float(out[min_idx])
+
+        if min_dist < 0.80 and min_dist > 0.05:
+            half_bubble_rad = math.atan2(self.safety_bubble_radius, min_dist)
+            beams_to_mask = int(math.ceil(half_bubble_rad / angle_inc))
+            start_idx = max(0, min_idx - beams_to_mask)
+            end_idx = min(len(out) - 1, min_idx + beams_to_mask)
+            out[start_idx:end_idx + 1] = 0.0
+
+        return out
+
+    def find_best_gap_heading(self, ranges, angle_min, angle_inc, threshold=1.4):
+        """Finds the deepest contiguous drivable corridor and returns its target angle in radians."""
+        total_beams = len(ranges)
+        fov_rad = math.radians(self.forward_fov_deg / 2.0)
+        idx_right = max(0, self.get_index_for_angle(-fov_rad, angle_min, angle_inc))
+        idx_left = min(total_beams - 1, self.get_index_for_angle(fov_rad, angle_min, angle_inc))
+        
+        idx_start = min(idx_right, idx_left)
+        idx_end = max(idx_right, idx_left)
+        sector = np.copy(ranges[idx_start:idx_end + 1])
+
+        mask = sector > threshold
         if not np.any(mask):
-            furthest_idx = int(np.argmax(sector_ranges))
-            return furthest_idx, furthest_idx
+            deepest_sector_idx = int(np.argmax(sector))
+            return angle_min + (idx_start + deepest_sector_idx) * angle_inc
 
         padded = np.concatenate(([0], mask.astype(int), [0]))
         diffs = np.diff(padded)
@@ -100,21 +130,23 @@ class WallFollowNode(Node):
         ends = np.where(diffs == -1)[0]
 
         best_score = -1.0
-        best_gap = (starts[0], ends[0] - 1)
+        best_target_idx = (starts[0] + ends[0] - 1) // 2
 
         for s, e in zip(starts, ends):
-            gap_slice = sector_ranges[s:e]
+            gap_slice = sector[s:e]
             width = e - s
             mean_depth = float(np.mean(gap_slice))
             max_depth = float(np.max(gap_slice))
 
-            # Depth-weighted score: heavily rewards the long open corridor
-            score = width * (mean_depth ** 1.8) * max_depth
+            # Reward long, clear corridors
+            score = width * (mean_depth ** 1.5) * max_depth
             if score > best_score:
                 best_score = score
-                best_gap = (s, e - 1)
+                # Steer towards center of the gap to stay clear of both walls
+                best_target_idx = s + int(width / 2.0)
 
-        return best_gap
+        target_global_idx = idx_start + best_target_idx
+        return angle_min + target_global_idx * angle_inc
 
     def lidar_callback(self, scan_msg: LaserScan):
         angle_min = scan_msg.angle_min
@@ -127,53 +159,83 @@ class WallFollowNode(Node):
         # 1. Clean raw LiDAR
         clean_ranges = self.preprocess_lidar(scan_msg.ranges)
 
-        # 2. Extract wide planning sector (+- 100 degrees to see 90-deg turns)
-        fov_rad = math.radians(self.forward_fov_deg / 2.0)
-        idx_right = max(0, self.get_index_for_angle(-fov_rad, angle_min, angle_inc))
-        idx_left = min(total_beams - 1, self.get_index_for_angle(fov_rad, angle_min, angle_inc))
+        # 2. Key directional sectors:
+        # Front cone: -18 deg to +18 deg
+        idx_f_left = self.get_index_for_angle(math.radians(18.0), angle_min, angle_inc)
+        idx_f_right = self.get_index_for_angle(math.radians(-18.0), angle_min, angle_inc)
+        front_dist = float(np.min(clean_ranges[min(idx_f_right, idx_f_left):max(idx_f_right, idx_f_left) + 1]))
 
-        idx_start = min(idx_right, idx_left)
-        idx_end = max(idx_right, idx_left)
-        sector = np.copy(clean_ranges[idx_start:idx_end + 1])
+        # Left opening sector: +25 deg to +95 deg
+        idx_l_start = self.get_index_for_angle(math.radians(25.0), angle_min, angle_inc)
+        idx_l_end = self.get_index_for_angle(math.radians(95.0), angle_min, angle_inc)
+        left_ranges = clean_ranges[min(idx_l_start, idx_l_end):max(idx_l_start, idx_l_end) + 1]
+        left_openness = float(np.mean(left_ranges))
 
-        # 3. Find the best corridor leading into the turn/intersection
-        gap_start, gap_end = self.find_best_corridor(sector, threshold=1.2)
+        # Right opening sector: -95 deg to -25 deg
+        idx_r_start = self.get_index_for_angle(math.radians(-95.0), angle_min, angle_inc)
+        idx_r_end = self.get_index_for_angle(math.radians(-25.0), angle_min, angle_inc)
+        right_ranges = clean_ranges[min(idx_r_start, idx_r_end):max(idx_r_start, idx_r_end) + 1]
+        right_openness = float(np.mean(right_ranges))
 
-        # 4. Target the SAFE CENTER of the corridor
-        goal_sector_idx = int((gap_start + gap_end) / 2.0)
-        target_global_idx = idx_start + goal_sector_idx
-        target_angle = angle_min + target_global_idx * angle_inc
+        # Side wall distances at 90 deg for straight line centering
+        idx_90_l = min(total_beams - 1, self.get_index_for_angle(math.radians(90.0), angle_min, angle_inc))
+        idx_90_r = max(0, self.get_index_for_angle(math.radians(-90.0), angle_min, angle_inc))
+        side_left = float(np.mean(clean_ranges[max(0, idx_90_l - 12):min(total_beams, idx_90_l + 13)]))
+        side_right = float(np.mean(clean_ranges[max(0, idx_90_r - 12):min(total_beams, idx_90_r + 13)]))
 
-        # 5. Direct Decisive Steering:
-        # Normalize target angle to steering range [-1.0, 1.0]
-        raw_steering = float(np.clip(target_angle / self.max_steer_rad, -1.0, 1.0))
+        # 3. Corner Detection & Early Turn Decision
+        # If the front wall is within 4.0m, a corner is imminent
+        corner_approaching = (front_dist < self.corner_turn_dist)
 
-        # Smooth steering to prevent twitching while maintaining rapid turn response
-        steering_cmd = self.steering_smooth_alpha * raw_steering + (1.0 - self.steering_smooth_alpha) * self.prev_steering
+        if corner_approaching or self.in_corner:
+            # We are preparing for, entering, or actively inside a corner
+            if not self.in_corner:
+                # Latched turn direction at entry
+                self.in_corner = True
+                self.latched_turn_dir = 1.0 if (left_openness > right_openness) else -1.0
+
+            # Turn intensity scales decisively from 0.60 at 4.0m to 1.0 at 2.2m
+            turn_progress = float(np.clip((self.corner_turn_dist - front_dist) / (self.corner_turn_dist - 2.2), 0.0, 1.0))
+            corner_steering = self.latched_turn_dir * (0.60 + 0.40 * turn_progress)
+
+            target_steering = float(np.clip(corner_steering, -1.0, 1.0))
+            throttle_cmd = self.corner_speed
+
+            # Release corner latch only when car is cleanly aligned in new corridor:
+            # - Front distance must be clear (> 4.2m)
+            # - Both side walls must be visible (< 2.2m), indicating the car has re-entered a corridor
+            if front_dist > 4.2 and side_left < 2.2 and side_right < 2.2:
+                self.in_corner = False
+
+        else:
+            # On a clear corridor: Follow the safest gap and maintain centerline balance
+            bubbled_ranges = self.apply_safety_bubble(clean_ranges, angle_min, angle_inc)
+            gap_heading_rad = self.find_best_gap_heading(bubbled_ranges, angle_min, angle_inc)
+
+            # Lateral centering trim
+            wall_error = side_left - side_right
+            centering_trim = float(np.clip(wall_error * 0.15, -0.25, 0.25))
+
+            # Combine gap heading and lateral trim
+            gap_steering = float(np.clip(gap_heading_rad / self.max_steer_rad, -0.80, 0.80))
+            target_steering = float(np.clip(gap_steering + centering_trim, -1.0, 1.0))
+
+            # Speed Profiling:
+            if front_dist > self.early_lookahead_dist:
+                throttle_cmd = self.straight_speed
+            else:
+                # Approaching corner (between 5.2m and 4.0m): smoothly decelerate to corner speed
+                alpha = (front_dist - self.corner_turn_dist) / (self.early_lookahead_dist - self.corner_turn_dist)
+                throttle_cmd = self.corner_speed + alpha * (self.straight_speed - self.corner_speed)
+
+        # 4. Smooth steering to eliminate oscillation while keeping rapid turn-in
+        steering_cmd = self.steering_smooth_alpha * target_steering + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         self.prev_steering = steering_cmd
 
-        # 6. Smooth Forward Throttle Control (ALWAYS POSITIVE - NO REVERSING!):
-        # Forward clearance directly ahead (+- 15 degrees)
-        center_idx = self.get_index_for_angle(0.0, angle_min, angle_inc)
-        forward_clearance = float(np.min(clean_ranges[max(0, center_idx - 25):min(total_beams, center_idx + 26)]))
-        turn_severity = abs(steering_cmd)
-
-        # If a turn or wall is approaching, smoothly settle into cornering speed
-        if forward_clearance < 3.2 or turn_severity > 0.20:
-            # Entering or in the turn: steady, planted corner speed
-            throttle_cmd = self.corner_speed
-        elif forward_clearance < 5.0:
-            # Smoothly transition from straight speed down to corner speed
-            alpha = (forward_clearance - 3.2) / (5.0 - 3.2)
-            throttle_cmd = self.corner_speed + alpha * (self.straight_speed - self.corner_speed)
-        else:
-            # Wide open straight
-            throttle_cmd = self.straight_speed
-
-        # Guarantee forward drive: clamp between min_drive_speed and straight_speed
+        # 5. Strict forward throttle clamp (NEVER REVERSE, NEVER STALL)
         throttle_cmd = float(np.clip(throttle_cmd, self.min_drive_speed, self.straight_speed))
 
-        # Publish commands
+        # 6. Publish actuator commands
         str_msg = Float32()
         str_msg.data = float(steering_cmd)
         self.steering_pub.publish(str_msg)
