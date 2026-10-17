@@ -46,8 +46,8 @@ class WallFollowNode(Node):
         self.corner_latch = 0.0        # Locks turn direction during cornering to prevent oscillation
         self.last_log_time = 0.0
 
-        # Steering dynamics: fast, decisive response (alpha = 0.85, turns into full lock in <0.05s)
-        self.steering_smooth_alpha = 0.85
+        # Steering dynamics: fast, direct transfer (alpha = 0.90, full steering lock in ~0.03s)
+        self.steering_smooth_alpha = 0.90
 
         # Reliable QoS matching AutoDRIVE Bridge
         qos = QoSProfile(
@@ -77,7 +77,7 @@ class WallFollowNode(Node):
             qos
         )
 
-        self.get_logger().info('RoboRacer Early High-Authority Wall Follow Node active.')
+        self.get_logger().info('RoboRacer High-Pressure Right-Turn Wall Follow Node active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc, total_beams):
         """Compute beam index dynamically from message fields."""
@@ -194,14 +194,12 @@ class WallFollowNode(Node):
         steer_pd = kp * error + kd * self.filtered_d_error
 
         # -------------------------------------------------------------
-        # 2. EARLY ANTICIPATORY CORNER LOGIC
+        # 2. EARLY HIGH-PRESSURE CORNER LOGIC
         # -------------------------------------------------------------
         # Front distance: min range in +-10 deg cone ahead
         front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
 
         # Forward-diagonal sectors (+20° to +85° left, -85° to -20° right)
-        # Looking forward-diagonal allows seeing the corner corridor 3.5m in advance
-        # while keeping sector_diff = 0.0 on straight corridors.
         idx_l20 = self.get_index_for_angle(math.radians(20.0), angle_min, angle_inc, total_beams)
         idx_l85 = self.get_index_for_angle(math.radians(85.0), angle_min, angle_inc, total_beams)
         left_sector = clean_ranges[min(idx_l20, idx_l85):max(idx_l20, idx_l85) + 1]
@@ -237,9 +235,9 @@ class WallFollowNode(Node):
             open_side_sign = 0.0
 
         if open_side_sign != 0.0:
-            # Immediate decisive cornering: starts with 0.65 steering, hits full lock 1.00 by 1.6m
-            ratio = float(np.clip((front_threshold - front) / max(0.01, front_threshold - 1.6), 0.0, 1.0))
-            corner_mag = float(0.65 + 0.35 * ratio)
+            # Higher corner pressure: starts with 0.80 steering authority, saturates at full lock 1.00 by 2.2m
+            ratio = float(np.clip((front_threshold - front) / max(0.01, front_threshold - 2.2), 0.0, 1.0))
+            corner_mag = float(0.80 + 0.20 * ratio)
             corner_steer = open_side_sign * corner_mag
 
             # Override or supplement PD wall term decisively
@@ -252,7 +250,7 @@ class WallFollowNode(Node):
             target_steer = steer_pd
 
         # -------------------------------------------------------------
-        # 4. FAST RESPONSIVE STEERING SMOOTHING (alpha = 0.85)
+        # 4. CRISP STEERING EXECUTION (alpha = 0.90)
         # -------------------------------------------------------------
         steering_cmd = self.steering_smooth_alpha * target_steer + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         steering_cmd = float(np.clip(steering_cmd, -1.0, 1.0))
