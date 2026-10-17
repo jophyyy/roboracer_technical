@@ -32,11 +32,11 @@ class WallFollowNode(Node):
         self.declare_parameter('desired_distance', 0.85)       # Target distance to followed wall (meters)
         self.declare_parameter('kp', 1.35)                     # Proportional gain (error in m -> steer [-1, 1])
         self.declare_parameter('kd', 0.40)                     # Derivative gain (d_error/dt -> steer [-1, 1])
-        self.declare_parameter('lookahead', 1.00)              # Lookahead projection distance L (meters)
+        self.declare_parameter('lookahead', 0.90)              # Lookahead projection distance L (meters)
         self.declare_parameter('max_throttle', 0.28)           # Top straightaway speed (conservative for clean laps)
         self.declare_parameter('min_throttle', 0.16)           # Corner speed floor
-        self.declare_parameter('front_threshold_base', 3.10)   # Early corner trigger distance (3.1m - 3.6m)
-        self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
+        self.declare_parameter('front_threshold_base', 2.60)   # Calibrated early corner trigger (2.6m - 3.2m)
+        self.declare_parameter('front_threshold_gain', 2.20)   # Speed multiplier for front clearance threshold
 
         # Internal controller state
         self.prev_error = None
@@ -44,13 +44,12 @@ class WallFollowNode(Node):
         self.filtered_d_error = 0.0
         self.prev_steering = 0.0
         self.prev_throttle = 0.20
-        self.corner_latch = 0.0
         self.start_time = None
-        self.launch_grace_until = 0.0  # Launch grace period (suppresses false spawn turn)
+        self.launch_grace_until = 0.0  # Launch grace period (suppresses false spawn turn for 2.0s)
         self.last_log_time = 0.0
 
-        # Steering dynamics: fast, direct response (alpha = 0.85)
-        self.steering_smooth_alpha = 0.85
+        # Steering dynamics: fast, decisive response (alpha = 0.80)
+        self.steering_smooth_alpha = 0.80
 
         # Reliable QoS matching AutoDRIVE Bridge
         qos = QoSProfile(
@@ -88,13 +87,12 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Early Anticipatory Wall Follow Node active.')
+        self.get_logger().info('RoboRacer Balanced Early-Turn Wall Follow Node active.')
 
     def reset_callback(self, msg: Bool):
         if msg.data:
             now_time = self.get_clock().now().nanoseconds * 1e-9
-            self.launch_grace_until = now_time + 1.5
-            self.corner_latch = 0.0
+            self.launch_grace_until = now_time + 2.0
             self.prev_steering = 0.0
             self.get_logger().info('Simulator reset detected: launch grace active.')
 
@@ -127,10 +125,10 @@ class WallFollowNode(Node):
 
         now_time = self.get_clock().now().nanoseconds * 1e-9
 
-        # Handle launch grace at initial startup
+        # Handle launch grace at initial startup (2.0s straight rollout)
         if self.start_time is None:
             self.start_time = now_time
-            self.launch_grace_until = now_time + 1.5
+            self.launch_grace_until = now_time + 2.0
 
         angle_min = scan_msg.angle_min
         angle_inc = scan_msg.angle_increment
@@ -219,7 +217,7 @@ class WallFollowNode(Node):
         steer_pd = kp * error + kd * self.filtered_d_error
 
         # -------------------------------------------------------------
-        # 2. EARLY ANTICIPATORY CORNER LOGIC (3.1m - 3.6m Trigger)
+        # 2. CALIBRATED EARLY ANTICIPATORY CORNER LOGIC (2.6m - 3.2m)
         # -------------------------------------------------------------
         # Front distance: min range in +-10 deg cone ahead
         front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
@@ -235,51 +233,47 @@ class WallFollowNode(Node):
         right_sector = clean_ranges[min(idx_r85, idx_r20):max(idx_r85, idx_r20) + 1]
         right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
 
-        # Speed-dependent front threshold: triggers early at ~3.5m in corners
+        # Speed-dependent front threshold: triggers early at ~3.0m - 3.2m in corners
         front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
         sector_diff = left_sector_avg - right_sector_avg
         is_launching = (now_time < self.launch_grace_until)
 
+        # Determine open side cleanly with deadband on every callback (NO permanent sticky latch!)
         if front < front_threshold and not is_launching:
-            # Approaching a corner:
-            if self.corner_latch != 0.0:
-                open_side_sign = self.corner_latch
-            elif sector_diff > 0.30:
+            if sector_diff > 0.35:
                 open_side_sign = 1.0   # Left is genuinely open
-                self.corner_latch = 1.0
-            elif sector_diff < -0.30:
+            elif sector_diff < -0.35:
                 open_side_sign = -1.0  # Right is genuinely open
-                self.corner_latch = -1.0
             else:
                 open_side_sign = 0.0   # Straight corridor
         else:
-            # Clear track, straightaway, or initial launch grace: pure PD wall following
-            self.corner_latch = 0.0
             open_side_sign = 0.0
 
         if open_side_sign != 0.0:
-            # FULL MAXIMUM TURN PRESSURE:
-            # Applies full steering lock (1.00) immediately across the entire corner!
-            corner_steer = open_side_sign * 1.0
+            # High-pressure early turn authority:
+            # Starts at 0.70 authority immediately, saturates to full lock 1.00 by 1.4m
+            urgency = (front_threshold - front) / max(0.01, front_threshold - 1.4)
+            corner_mag = float(np.clip(0.70 + 0.30 * urgency, 0.70, 1.0))
+            corner_steer = open_side_sign * corner_mag
 
-            # Override PD wall term decisively so the car commits with full steering lock
+            # Override PD wall term decisively so the car commits to the corner
             if open_side_sign > 0:  # Turning LEFT
                 target_steer = max(steer_pd, corner_steer)
             else:                   # Turning RIGHT
                 target_steer = min(steer_pd, corner_steer)
         else:
-            # Straight corridor: pure PD wall following (drives straight forward without weaving!)
+            # Straight corridor / launch: pure PD wall following (drives straight forward without weaving!)
             target_steer = steer_pd
 
         # -------------------------------------------------------------
-        # 4. CRISP STEERING EXECUTION (alpha = 0.85)
+        # 4. CRISP STEERING EXECUTION (alpha = 0.80)
         # -------------------------------------------------------------
         steering_cmd = self.steering_smooth_alpha * target_steer + (1.0 - self.steering_smooth_alpha) * self.prev_steering
         steering_cmd = float(np.clip(steering_cmd, -1.0, 1.0))
         self.prev_steering = steering_cmd
 
         # -------------------------------------------------------------
-        # 3. SPEED SCHEDULING (Brakes early before corner entry)
+        # 3. SPEED SCHEDULING (Pre-Corner Deceleration for Tire Grip)
         # -------------------------------------------------------------
         t_front = float(np.clip((front - 1.0) / 3.0, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
