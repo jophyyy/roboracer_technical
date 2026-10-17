@@ -27,15 +27,15 @@ class WallFollowNode(Node):
         # -------------------------------------------------------------
         # ROS 2 Tunable Parameters (reconfigurable via --ros-args -p ...)
         # -------------------------------------------------------------
-        self.declare_parameter('follow_side', 'left')          # 'left' (counter-clockwise) or 'right' (clockwise)
+        self.declare_parameter('follow_side', 'left')          # 'left' or 'right'
         self.declare_parameter('desired_distance', 0.85)       # Target distance to followed wall (meters)
         self.declare_parameter('kp', 1.25)                     # Proportional gain (error in m -> steer [-1, 1])
-        self.declare_parameter('kd', 0.35)                     # Derivative gain (d_error/dt -> steer [-1, 1])
-        self.declare_parameter('lookahead', 0.80)              # Lookahead projection distance L (meters)
-        self.declare_parameter('max_throttle', 0.30)           # Top straightaway speed (start conservative)
-        self.declare_parameter('min_throttle', 0.18)           # Base speed floor in tight corners
-        self.declare_parameter('front_threshold_base', 1.70)   # Base front clearance distance to trigger corner logic
-        self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
+        self.declare_parameter('kd', 0.40)                     # Derivative gain (d_error/dt -> steer [-1, 1])
+        self.declare_parameter('lookahead', 1.00)              # Lookahead projection distance L (meters)
+        self.declare_parameter('max_throttle', 0.28)           # Top straightaway speed (conservative for clean laps)
+        self.declare_parameter('min_throttle', 0.16)           # Base speed floor in tight corners
+        self.declare_parameter('front_threshold_base', 2.80)   # Earlier trigger: base front clearance distance
+        self.declare_parameter('front_threshold_gain', 2.50)   # Speed multiplier for front clearance threshold
 
         # Internal state
         self.prev_error = None
@@ -44,8 +44,8 @@ class WallFollowNode(Node):
         self.prev_throttle = 0.20
         self.last_log_time = 0.0
 
-        # Steering dynamics: responsive light filter (alpha >= 0.60)
-        self.steering_smooth_alpha = 0.65
+        # Steering dynamics: fast, responsive light filter (alpha >= 0.60)
+        self.steering_smooth_alpha = 0.70
 
         # Reliable QoS matching AutoDRIVE Bridge
         qos = QoSProfile(
@@ -75,7 +75,7 @@ class WallFollowNode(Node):
             qos
         )
 
-        self.get_logger().info('RoboRacer Wall Follow Node initialized successfully.')
+        self.get_logger().info('RoboRacer Early Anticipatory Wall Follow Node active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc, total_beams):
         """Compute beam index dynamically from message fields."""
@@ -208,6 +208,7 @@ class WallFollowNode(Node):
         right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
 
         # Speed-dependent front threshold: front < base + gain * speed
+        # Triggers turn entry early (typically 3.0m - 3.5m)
         front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
 
         if front < front_threshold:
@@ -218,10 +219,10 @@ class WallFollowNode(Node):
             else:
                 open_side_sign = -1.0
 
-            # Steering magnitude increases as front distance decreases, saturating at full lock (+-1.0)
-            k = 1.6
-            fraction = (front_threshold - front) / max(0.01, front_threshold)
-            corner_mag = float(np.clip(fraction * k, 0.5, 1.0))
+            # Progressive corner steering:
+            # Smoothly initiates at 0.40 at the threshold, scaling up to 1.0 (full lock) as front clearance drops to 1.0m.
+            ratio = float(np.clip((front_threshold - front) / max(0.01, front_threshold - 1.0), 0.0, 1.0))
+            corner_mag = float(0.40 + 0.60 * ratio)
             corner_steer = open_side_sign * corner_mag
 
             # Override or supplement PD wall term so corner is anticipated early and decisively
@@ -244,10 +245,10 @@ class WallFollowNode(Node):
         # 3. SPEED SCHEDULING
         # -------------------------------------------------------------
         # Throttle depends on front clearance and steering angle:
-        # throttle = lerp(min_throttle, max_throttle, clamp((front - 0.8)/4.0, 0, 1)) * (1 - 0.5*|steer|)
-        t_front = float(np.clip((front - 0.8) / 4.0, 0.0, 1.0))
+        # Brake smoothly BEFORE corner entry down to cornering speed
+        t_front = float(np.clip((front - 0.8) / 3.2, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
-        throttle_cmd = throttle_lerp * (1.0 - 0.5 * abs(steering_cmd))
+        throttle_cmd = throttle_lerp * (1.0 - 0.45 * abs(steering_cmd))
         throttle_cmd = float(np.clip(throttle_cmd, min_throttle * 0.75, max_throttle))
         self.prev_throttle = throttle_cmd
 
