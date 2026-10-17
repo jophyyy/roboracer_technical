@@ -2,7 +2,7 @@
 
 """
 AutoDRIVE RoboRacer Autonomous Wall-Following & Anticipatory Cornering Controller
-With Gradual Deceleration, Stable Straightaway Tracking, and Full Corner Authority
+With Smooth Deceleration Glide down to Calibrated Corner Speed (0.15)
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
@@ -34,8 +34,8 @@ class WallFollowNode(Node):
         self.declare_parameter('kp', 1.10)                     # Proportional gain (calm on straightaways)
         self.declare_parameter('kd', 0.45)                     # Derivative damping gain
         self.declare_parameter('lookahead', 0.90)              # Lookahead projection distance L (meters)
-        self.declare_parameter('max_throttle', 0.28)           # Top straightaway speed
-        self.declare_parameter('min_throttle', 0.21)           # Sustained cornering throttle (carries momentum)
+        self.declare_parameter('max_throttle', 0.28)           # Top straightaway cruising speed
+        self.declare_parameter('min_throttle', 0.15)           # Calibrated corner speed floor (slows down enough to grip)
         self.declare_parameter('front_threshold_base', 2.80)   # Corner trigger distance (2.8m - 3.4m)
         self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
 
@@ -44,7 +44,7 @@ class WallFollowNode(Node):
         self.prev_time = None
         self.filtered_d_error = 0.0
         self.prev_steering = 0.0
-        self.prev_throttle = 0.24
+        self.prev_throttle = 0.22
         self.start_time = None
         self.launch_grace_until = 0.0  # Launch grace period (2.0s straight rollout at spawn)
         self.last_log_time = 0.0
@@ -85,14 +85,14 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Smooth-Deceleration & Stable-Straight Wall Follow Node active.')
+        self.get_logger().info('RoboRacer Controlled-Cornering Speed Wall Follow Node active.')
 
     def reset_callback(self, msg: Bool):
         if msg.data:
             now_time = self.get_clock().now().nanoseconds * 1e-9
             self.launch_grace_until = now_time + 2.0
             self.prev_steering = 0.0
-            self.prev_throttle = 0.22
+            self.prev_throttle = 0.20
             self.get_logger().info('Simulator reset detected: launch grace active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc, total_beams):
@@ -155,7 +155,6 @@ class WallFollowNode(Node):
         # -------------------------------------------------------------
         # 1. TWO-BEAM LOOKAHEAD WALL-ANGLE METHOD
         # -------------------------------------------------------------
-        # Beam b at 90 deg to followed wall, beam a at 50 deg from followed wall (40 deg forward of side beam).
         theta = math.radians(40.0)
 
         if follow_side == 'right':
@@ -260,17 +259,16 @@ class WallFollowNode(Node):
         self.prev_steering = steering_cmd
 
         # -------------------------------------------------------------
-        # 4. GRADUAL, SMOOTH DECELERATION (NEVER DROPS INSTANTLY)
+        # 4. PROGRESSIVE DECELERATION GLIDE DOWN TO CORNER SPEED (0.15)
         # -------------------------------------------------------------
-        # Calculate target throttle based on front clearance
-        t_front = float(np.clip((front - 1.0) / 3.2, 0.0, 1.0))
+        # As front drops from 3.5m down to 1.2m, speed glides smoothly from 0.28 to 0.15
+        t_front = float(np.clip((front - 1.2) / 2.3, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
-        target_throttle = throttle_lerp * (1.0 - 0.20 * abs(steering_cmd))
+        target_throttle = throttle_lerp * (1.0 - 0.30 * abs(steering_cmd))
         target_throttle = float(np.clip(target_throttle, min_throttle, max_throttle))
 
-        # First-order low-pass filter on throttle (alpha = 0.10):
-        # Creates a smooth, progressive deceleration glide over ~0.4s instead of an instant drop
-        throttle_filter_alpha = 0.10
+        # First-order low-pass filter on throttle: smooth 0.4s deceleration glide
+        throttle_filter_alpha = 0.12
         throttle_cmd = throttle_filter_alpha * target_throttle + (1.0 - throttle_filter_alpha) * self.prev_throttle
         throttle_cmd = float(np.clip(throttle_cmd, min_throttle, max_throttle))
         self.prev_throttle = throttle_cmd
