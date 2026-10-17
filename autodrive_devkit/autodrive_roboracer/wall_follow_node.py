@@ -5,6 +5,7 @@ AutoDRIVE RoboRacer Autonomous Wall-Following & Anticipatory Cornering Controlle
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
+  /autodrive/reset_command (std_msgs/Bool)
 
 Publishes:
   /autodrive/roboracer_1/throttle_command (std_msgs/Float32) [-1.0, 1.0]
@@ -17,7 +18,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Bool
 
 
 class WallFollowNode(Node):
@@ -31,11 +32,11 @@ class WallFollowNode(Node):
         self.declare_parameter('desired_distance', 0.85)       # Target distance to followed wall (meters)
         self.declare_parameter('kp', 1.35)                     # Proportional gain (error in m -> steer [-1, 1])
         self.declare_parameter('kd', 0.40)                     # Derivative gain (d_error/dt -> steer [-1, 1])
-        self.declare_parameter('lookahead', 0.85)              # Lookahead projection distance L (meters)
+        self.declare_parameter('lookahead', 1.00)              # Lookahead projection distance L (meters)
         self.declare_parameter('max_throttle', 0.28)           # Top straightaway speed (conservative for clean laps)
         self.declare_parameter('min_throttle', 0.16)           # Corner speed floor
-        self.declare_parameter('front_threshold_base', 2.10)   # Corner trigger base (safe from spawn 2.95m)
-        self.declare_parameter('front_threshold_gain', 1.60)   # Speed multiplier (~2.4m at speed)
+        self.declare_parameter('front_threshold_base', 3.10)   # Early corner trigger distance (3.1m - 3.6m)
+        self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
 
         # Internal controller state
         self.prev_error = None
@@ -44,6 +45,8 @@ class WallFollowNode(Node):
         self.prev_steering = 0.0
         self.prev_throttle = 0.20
         self.corner_latch = 0.0
+        self.start_time = None
+        self.launch_grace_until = 0.0  # Launch grace period (suppresses false spawn turn)
         self.last_log_time = 0.0
 
         # Steering dynamics: fast, direct response (alpha = 0.85)
@@ -77,7 +80,23 @@ class WallFollowNode(Node):
             qos
         )
 
-        self.get_logger().info('RoboRacer Full-Authority Cornering Wall Follow Node active.')
+        # Simulator Reset Subscriber
+        self.reset_sub = self.create_subscription(
+            Bool,
+            '/autodrive/reset_command',
+            self.reset_callback,
+            1
+        )
+
+        self.get_logger().info('RoboRacer Early Anticipatory Wall Follow Node active.')
+
+    def reset_callback(self, msg: Bool):
+        if msg.data:
+            now_time = self.get_clock().now().nanoseconds * 1e-9
+            self.launch_grace_until = now_time + 1.5
+            self.corner_latch = 0.0
+            self.prev_steering = 0.0
+            self.get_logger().info('Simulator reset detected: launch grace active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc, total_beams):
         """Compute beam index dynamically from message fields."""
@@ -105,6 +124,13 @@ class WallFollowNode(Node):
         total_beams = len(scan_msg.ranges)
         if total_beams == 0:
             return
+
+        now_time = self.get_clock().now().nanoseconds * 1e-9
+
+        # Handle launch grace at initial startup
+        if self.start_time is None:
+            self.start_time = now_time
+            self.launch_grace_until = now_time + 1.5
 
         angle_min = scan_msg.angle_min
         angle_inc = scan_msg.angle_increment
@@ -173,7 +199,6 @@ class WallFollowNode(Node):
             error = D_future - desired_dist
 
         # Compute derivative safely with a low-pass filter to eliminate single-tick sensor jitter
-        now_time = self.get_clock().now().nanoseconds * 1e-9
         if self.prev_time is None:
             dt = 0.0
         else:
@@ -194,7 +219,7 @@ class WallFollowNode(Node):
         steer_pd = kp * error + kd * self.filtered_d_error
 
         # -------------------------------------------------------------
-        # 2. CALIBRATED CORNER LOGIC WITH MAXIMUM TURN PRESSURE
+        # 2. EARLY ANTICIPATORY CORNER LOGIC (3.1m - 3.6m Trigger)
         # -------------------------------------------------------------
         # Front distance: min range in +-10 deg cone ahead
         front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
@@ -210,26 +235,30 @@ class WallFollowNode(Node):
         right_sector = clean_ranges[min(idx_r85, idx_r20):max(idx_r85, idx_r20) + 1]
         right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
 
-        # Speed-dependent front threshold:
-        # At start line, front is ~2.95m. Threshold is 2.10 + 1.6*0.20 = 2.42m < 2.95m (NO false trigger!)
-        # Approaching a corner, triggers at ~2.50m.
+        # Speed-dependent front threshold: triggers early at ~3.5m in corners
         front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
         sector_diff = left_sector_avg - right_sector_avg
+        is_launching = (now_time < self.launch_grace_until)
 
-        if front < front_threshold:
-            # Approaching corner with wall < 2.5m ahead:
-            if sector_diff > 0.30:
+        if front < front_threshold and not is_launching:
+            # Approaching a corner:
+            if self.corner_latch != 0.0:
+                open_side_sign = self.corner_latch
+            elif sector_diff > 0.30:
                 open_side_sign = 1.0   # Left is genuinely open
+                self.corner_latch = 1.0
             elif sector_diff < -0.30:
                 open_side_sign = -1.0  # Right is genuinely open
+                self.corner_latch = -1.0
             else:
                 open_side_sign = 0.0   # Straight corridor
         else:
-            # Clear track / straightaway: pure PD wall following
+            # Clear track, straightaway, or initial launch grace: pure PD wall following
+            self.corner_latch = 0.0
             open_side_sign = 0.0
 
         if open_side_sign != 0.0:
-            # MAXIMUM TURN PRESSURE:
+            # FULL MAXIMUM TURN PRESSURE:
             # Applies full steering lock (1.00) immediately across the entire corner!
             corner_steer = open_side_sign * 1.0
 
@@ -250,10 +279,9 @@ class WallFollowNode(Node):
         self.prev_steering = steering_cmd
 
         # -------------------------------------------------------------
-        # 3. SPEED SCHEDULING (Pre-Corner Deceleration for Tire Grip)
+        # 3. SPEED SCHEDULING (Brakes early before corner entry)
         # -------------------------------------------------------------
-        # Brake before corner so tires have 100% cornering grip
-        t_front = float(np.clip((front - 0.8) / 3.0, 0.0, 1.0))
+        t_front = float(np.clip((front - 1.0) / 3.0, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
         throttle_cmd = throttle_lerp * (1.0 - 0.45 * abs(steering_cmd))
         throttle_cmd = float(np.clip(throttle_cmd, min_throttle * 0.85, max_throttle))
