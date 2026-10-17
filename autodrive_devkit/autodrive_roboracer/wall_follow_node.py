@@ -2,7 +2,7 @@
 
 """
 AutoDRIVE RoboRacer Autonomous Wall-Following & Anticipatory Cornering Controller
-With Smooth Deceleration Glide down to Calibrated Corner Speed (0.15)
+With Deep Cornering Arc, Early 3.5m Turn-In, and Smooth Gradual Deceleration
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
@@ -33,10 +33,10 @@ class WallFollowNode(Node):
         self.declare_parameter('desired_distance', 0.65)       # Target distance: rides left side for wide corner radius
         self.declare_parameter('kp', 1.10)                     # Proportional gain (calm on straightaways)
         self.declare_parameter('kd', 0.45)                     # Derivative damping gain
-        self.declare_parameter('lookahead', 0.90)              # Lookahead projection distance L (meters)
+        self.declare_parameter('lookahead', 1.00)              # Lookahead projection distance L (meters)
         self.declare_parameter('max_throttle', 0.28)           # Top straightaway cruising speed
         self.declare_parameter('min_throttle', 0.15)           # Calibrated corner speed floor (slows down enough to grip)
-        self.declare_parameter('front_threshold_base', 2.80)   # Corner trigger distance (2.8m - 3.4m)
+        self.declare_parameter('front_threshold_base', 3.40)   # Deep-turn early trigger distance (3.4m - 3.9m)
         self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
 
         # Internal controller state
@@ -85,7 +85,7 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Controlled-Cornering Speed Wall Follow Node active.')
+        self.get_logger().info('RoboRacer Deep-Arc Early Turn Wall Follow Node active.')
 
     def reset_callback(self, msg: Bool):
         if msg.data:
@@ -199,7 +199,7 @@ class WallFollowNode(Node):
         steer_pd = kp * error + kd * self.filtered_d_error
 
         # -------------------------------------------------------------
-        # 2. CALIBRATED CORNER DETECTION WITH FORWARD-DIAGONAL SECTORS
+        # 2. CALIBRATED EARLY DEEP-TURN DETECTION (3.4m - 3.9m Trigger)
         # -------------------------------------------------------------
         # Front distance: min range in +-10 deg cone ahead
         front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
@@ -215,6 +215,7 @@ class WallFollowNode(Node):
         right_sector = clean_ranges[min(idx_r85, idx_r20):max(idx_r85, idx_r20) + 1]
         right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
 
+        # Speed-dependent front threshold: triggers early at ~3.5m - 3.9m in corners
         front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
         sector_diff = left_sector_avg - right_sector_avg
         is_launching = (now_time < self.launch_grace_until)
@@ -231,10 +232,10 @@ class WallFollowNode(Node):
             open_side_sign = 0.0
 
         # -------------------------------------------------------------
-        # 3. STEERING CONTROL: CALM ON STRAIGHTS, FULL LOCK IN CORNERS
+        # 3. STEERING CONTROL: DEEP-ARC CORNERING, CALM ON STRAIGHTS
         # -------------------------------------------------------------
         if open_side_sign != 0.0:
-            # Full lock 1.00 steering pressure across the turn
+            # Full lock 1.00 steering pressure across the deep turn
             corner_steer = open_side_sign * 1.0
 
             if open_side_sign > 0:  # Turning LEFT
@@ -242,8 +243,8 @@ class WallFollowNode(Node):
             else:                   # Turning RIGHT
                 target_steer = min(steer_pd, corner_steer)
 
-            # Fast, decisive steering response entering corner
-            alpha_steer = 0.80
+            # Instant steering bite into deep corner
+            alpha_steer = 0.90
         else:
             # Straight corridor / launch:
             # Apply 3cm deadband on error so the car never micro-hunts or wobbles on straights
@@ -261,8 +262,8 @@ class WallFollowNode(Node):
         # -------------------------------------------------------------
         # 4. PROGRESSIVE DECELERATION GLIDE DOWN TO CORNER SPEED (0.15)
         # -------------------------------------------------------------
-        # As front drops from 3.5m down to 1.2m, speed glides smoothly from 0.28 to 0.15
-        t_front = float(np.clip((front - 1.2) / 2.3, 0.0, 1.0))
+        # As front drops from 3.8m down to 1.4m, speed glides smoothly from 0.28 to 0.15
+        t_front = float(np.clip((front - 1.4) / 2.4, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
         target_throttle = throttle_lerp * (1.0 - 0.30 * abs(steering_cmd))
         target_throttle = float(np.clip(target_throttle, min_throttle, max_throttle))
