@@ -2,7 +2,7 @@
 
 """
 AutoDRIVE RoboRacer Autonomous Wall-Following & Anticipatory Cornering Controller
-With Outside-Line Corner Entry Setup & Sustained Cornering Momentum
+With Gradual Deceleration, Stable Straightaway Tracking, and Full Corner Authority
 
 Subscribes:
   /autodrive/roboracer_1/lidar (sensor_msgs/LaserScan)
@@ -30,13 +30,13 @@ class WallFollowNode(Node):
         # ROS 2 Tunable Parameters (reconfigurable via --ros-args -p ...)
         # -------------------------------------------------------------
         self.declare_parameter('follow_side', 'left')          # 'left' or 'right'
-        self.declare_parameter('desired_distance', 0.60)       # Target distance: hugs left side to maximize right-turn radius
-        self.declare_parameter('kp', 1.35)                     # Proportional gain (error in m -> steer [-1, 1])
-        self.declare_parameter('kd', 0.40)                     # Derivative gain (d_error/dt -> steer [-1, 1])
+        self.declare_parameter('desired_distance', 0.65)       # Target distance: rides left side for wide corner radius
+        self.declare_parameter('kp', 1.10)                     # Proportional gain (calm on straightaways)
+        self.declare_parameter('kd', 0.45)                     # Derivative damping gain
         self.declare_parameter('lookahead', 0.90)              # Lookahead projection distance L (meters)
-        self.declare_parameter('max_throttle', 0.30)           # Top straightaway speed
-        self.declare_parameter('min_throttle', 0.22)           # Sustained cornering throttle (carries drive energy through turn)
-        self.declare_parameter('front_threshold_base', 2.80)   # Early corner trigger distance (2.8m - 3.4m)
+        self.declare_parameter('max_throttle', 0.28)           # Top straightaway speed
+        self.declare_parameter('min_throttle', 0.21)           # Sustained cornering throttle (carries momentum)
+        self.declare_parameter('front_threshold_base', 2.80)   # Corner trigger distance (2.8m - 3.4m)
         self.declare_parameter('front_threshold_gain', 2.00)   # Speed multiplier for front clearance threshold
 
         # Internal controller state
@@ -44,13 +44,10 @@ class WallFollowNode(Node):
         self.prev_time = None
         self.filtered_d_error = 0.0
         self.prev_steering = 0.0
-        self.prev_throttle = 0.22
+        self.prev_throttle = 0.24
         self.start_time = None
-        self.launch_grace_until = 0.0  # Launch grace period (suppresses false spawn turn for 2.0s)
+        self.launch_grace_until = 0.0  # Launch grace period (2.0s straight rollout at spawn)
         self.last_log_time = 0.0
-
-        # Steering dynamics: fast, direct response (alpha = 0.85)
-        self.steering_smooth_alpha = 0.85
 
         # Reliable QoS matching AutoDRIVE Bridge
         qos = QoSProfile(
@@ -88,13 +85,14 @@ class WallFollowNode(Node):
             1
         )
 
-        self.get_logger().info('RoboRacer Outside-Line High-Momentum Cornering Controller active.')
+        self.get_logger().info('RoboRacer Smooth-Deceleration & Stable-Straight Wall Follow Node active.')
 
     def reset_callback(self, msg: Bool):
         if msg.data:
             now_time = self.get_clock().now().nanoseconds * 1e-9
             self.launch_grace_until = now_time + 2.0
             self.prev_steering = 0.0
+            self.prev_throttle = 0.22
             self.get_logger().info('Simulator reset detected: launch grace active.')
 
     def get_index_for_angle(self, angle_rad, angle_min, angle_inc, total_beams):
@@ -145,7 +143,7 @@ class WallFollowNode(Node):
 
         # Dynamic parameter lookup
         follow_side = self.get_parameter('follow_side').get_parameter_value().string_value.lower()
-        base_desired_dist = self.get_parameter('desired_distance').get_parameter_value().double_value
+        desired_dist = self.get_parameter('desired_distance').get_parameter_value().double_value
         kp = self.get_parameter('kp').get_parameter_value().double_value
         kd = self.get_parameter('kd').get_parameter_value().double_value
         lookahead = self.get_parameter('lookahead').get_parameter_value().double_value
@@ -155,34 +153,7 @@ class WallFollowNode(Node):
         front_thresh_gain = self.get_parameter('front_threshold_gain').get_parameter_value().double_value
 
         # -------------------------------------------------------------
-        # 1. FORWARD-DIAGONAL SECTORS FOR CORNER DETECTION & OUTSIDE LINE SETUP
-        # -------------------------------------------------------------
-        # Front distance: min range in +-10 deg cone ahead
-        front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
-
-        # Forward-diagonal sectors (+20° to +85° left, -85° to -20° right)
-        idx_l20 = self.get_index_for_angle(math.radians(20.0), angle_min, angle_inc, total_beams)
-        idx_l85 = self.get_index_for_angle(math.radians(85.0), angle_min, angle_inc, total_beams)
-        left_sector = clean_ranges[min(idx_l20, idx_l85):max(idx_l20, idx_l85) + 1]
-        left_sector_avg = float(np.mean(left_sector)) if len(left_sector) > 0 else 0.0
-
-        idx_r85 = self.get_index_for_angle(math.radians(-85.0), angle_min, angle_inc, total_beams)
-        idx_r20 = self.get_index_for_angle(math.radians(-20.0), angle_min, angle_inc, total_beams)
-        right_sector = clean_ranges[min(idx_r85, idx_r20):max(idx_r85, idx_r20) + 1]
-        right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
-
-        sector_diff = left_sector_avg - right_sector_avg
-        front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
-        is_launching = (now_time < self.launch_grace_until)
-
-        # Outside-line setup: when approaching a right turn (sector_diff < -0.30),
-        # gear up towards the left wall (0.50m) to maximize entry turning radius!
-        desired_dist = base_desired_dist
-        if sector_diff < -0.30 and front < 4.2:
-            desired_dist = min(base_desired_dist, 0.50)  # Tuck in against the left wall for maximum right radius
-
-        # -------------------------------------------------------------
-        # 2. TWO-BEAM LOOKAHEAD WALL-ANGLE METHOD
+        # 1. TWO-BEAM LOOKAHEAD WALL-ANGLE METHOD
         # -------------------------------------------------------------
         # Beam b at 90 deg to followed wall, beam a at 50 deg from followed wall (40 deg forward of side beam).
         theta = math.radians(40.0)
@@ -210,7 +181,7 @@ class WallFollowNode(Node):
         else:
             error = D_future - desired_dist
 
-        # Compute derivative safely with a low-pass filter
+        # Compute derivative safely with a low-pass filter to eliminate sensor chatter
         if self.prev_time is None:
             dt = 0.0
         else:
@@ -229,8 +200,27 @@ class WallFollowNode(Node):
         steer_pd = kp * error + kd * self.filtered_d_error
 
         # -------------------------------------------------------------
-        # 3. HIGH-PRESSURE ANTICIPATORY CORNERING
+        # 2. CALIBRATED CORNER DETECTION WITH FORWARD-DIAGONAL SECTORS
         # -------------------------------------------------------------
+        # Front distance: min range in +-10 deg cone ahead
+        front = self.get_range_window(clean_ranges, 0.0, angle_min, angle_inc, window_deg=10.0, mode='min')
+
+        # Forward-diagonal sectors (+20° to +85° left, -85° to -20° right)
+        idx_l20 = self.get_index_for_angle(math.radians(20.0), angle_min, angle_inc, total_beams)
+        idx_l85 = self.get_index_for_angle(math.radians(85.0), angle_min, angle_inc, total_beams)
+        left_sector = clean_ranges[min(idx_l20, idx_l85):max(idx_l20, idx_l85) + 1]
+        left_sector_avg = float(np.mean(left_sector)) if len(left_sector) > 0 else 0.0
+
+        idx_r85 = self.get_index_for_angle(math.radians(-85.0), angle_min, angle_inc, total_beams)
+        idx_r20 = self.get_index_for_angle(math.radians(-20.0), angle_min, angle_inc, total_beams)
+        right_sector = clean_ranges[min(idx_r85, idx_r20):max(idx_r85, idx_r20) + 1]
+        right_sector_avg = float(np.mean(right_sector)) if len(right_sector) > 0 else 0.0
+
+        front_threshold = front_thresh_base + front_thresh_gain * max(0.0, self.prev_throttle)
+        sector_diff = left_sector_avg - right_sector_avg
+        is_launching = (now_time < self.launch_grace_until)
+
+        # Detect corner vs straight corridor cleanly
         if front < front_threshold and not is_launching:
             if sector_diff > 0.35:
                 open_side_sign = 1.0   # Left is open
@@ -241,6 +231,9 @@ class WallFollowNode(Node):
         else:
             open_side_sign = 0.0
 
+        # -------------------------------------------------------------
+        # 3. STEERING CONTROL: CALM ON STRAIGHTS, FULL LOCK IN CORNERS
+        # -------------------------------------------------------------
         if open_side_sign != 0.0:
             # Full lock 1.00 steering pressure across the turn
             corner_steer = open_side_sign * 1.0
@@ -249,26 +242,37 @@ class WallFollowNode(Node):
                 target_steer = max(steer_pd, corner_steer)
             else:                   # Turning RIGHT
                 target_steer = min(steer_pd, corner_steer)
-        else:
-            # Straight corridor / launch: pure PD wall following
-            target_steer = steer_pd
 
-        # -------------------------------------------------------------
-        # 4. CRISP STEERING EXECUTION (alpha = 0.85)
-        # -------------------------------------------------------------
-        steering_cmd = self.steering_smooth_alpha * target_steer + (1.0 - self.steering_smooth_alpha) * self.prev_steering
+            # Fast, decisive steering response entering corner
+            alpha_steer = 0.80
+        else:
+            # Straight corridor / launch:
+            # Apply 3cm deadband on error so the car never micro-hunts or wobbles on straights
+            if abs(error) < 0.03:
+                steer_pd = 0.0
+
+            target_steer = steer_pd
+            # Gentle, calm steering filter on straightaways (prevents alternating left-right)
+            alpha_steer = 0.40
+
+        steering_cmd = alpha_steer * target_steer + (1.0 - alpha_steer) * self.prev_steering
         steering_cmd = float(np.clip(steering_cmd, -1.0, 1.0))
         self.prev_steering = steering_cmd
 
         # -------------------------------------------------------------
-        # 5. SUSTAINED CORNERING DRIVE ENERGY (min_throttle = 0.22)
+        # 4. GRADUAL, SMOOTH DECELERATION (NEVER DROPS INSTANTLY)
         # -------------------------------------------------------------
-        # Maintain positive forward momentum through the turn so tires have drive force to pull through
-        t_front = float(np.clip((front - 1.0) / 3.0, 0.0, 1.0))
+        # Calculate target throttle based on front clearance
+        t_front = float(np.clip((front - 1.0) / 3.2, 0.0, 1.0))
         throttle_lerp = min_throttle + t_front * (max_throttle - min_throttle)
-        # Gentle scale by steering angle so drive energy is never strangled in the corner
-        throttle_cmd = throttle_lerp * (1.0 - 0.25 * abs(steering_cmd))
-        throttle_cmd = float(np.clip(throttle_cmd, min_throttle * 0.90, max_throttle))
+        target_throttle = throttle_lerp * (1.0 - 0.20 * abs(steering_cmd))
+        target_throttle = float(np.clip(target_throttle, min_throttle, max_throttle))
+
+        # First-order low-pass filter on throttle (alpha = 0.10):
+        # Creates a smooth, progressive deceleration glide over ~0.4s instead of an instant drop
+        throttle_filter_alpha = 0.10
+        throttle_cmd = throttle_filter_alpha * target_throttle + (1.0 - throttle_filter_alpha) * self.prev_throttle
+        throttle_cmd = float(np.clip(throttle_cmd, min_throttle, max_throttle))
         self.prev_throttle = throttle_cmd
 
         # -------------------------------------------------------------
